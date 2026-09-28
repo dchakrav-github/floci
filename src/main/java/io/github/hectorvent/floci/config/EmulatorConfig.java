@@ -115,6 +115,8 @@ public interface EmulatorConfig {
 
     ProtocolsConfig protocols();
 
+    ChaosConfig chaos();
+
     interface NetworkConfig {
         SecurityGroupEnforcementConfig securityGroupEnforcement();
     }
@@ -162,6 +164,69 @@ public interface EmulatorConfig {
          */
         @WithDefault("true")
         boolean rejectUnknownServiceScope();
+    }
+
+    /**
+     * Fault and network chaos injection, plus HAR request/response logging. Everything here is
+     * off by default, so a deployment that does not set {@code floci.chaos.*} behaves exactly as
+     * it did before: {@link io.github.hectorvent.floci.core.common.ChaosInterceptorFilter} returns
+     * immediately unless {@link #enabled()} is set, and
+     * {@link io.github.hectorvent.floci.core.common.HarLoggingFilter} unless
+     * {@link HarConfig#enabled()} is.
+     *
+     * <p>Environment variables follow the usual mapping:
+     * {@code FLOCI_CHAOS_ENABLED}, {@code FLOCI_CHAOS_HAR_ENABLED}, {@code FLOCI_CHAOS_HAR_FILE},
+     * {@code FLOCI_CHAOS_FAULT_FAULT_PROBABILITY},
+     * {@code FLOCI_CHAOS_FAULT_THROTTLE_PROBABILITY},
+     * {@code FLOCI_CHAOS_FAULT_ACCESS_DENIED_PROBABILITY},
+     * {@code FLOCI_CHAOS_NETWORK_LATENCY_PROBABILITY},
+     * {@code FLOCI_CHAOS_NETWORK_LATENCY_MS},
+     * {@code FLOCI_CHAOS_NETWORK_NO_RESPONSE_PROBABILITY}.
+     */
+    interface ChaosConfig {
+
+        /** Master switch for fault and network injection. HAR logging has its own switch. */
+        @WithDefault("false")
+        boolean enabled();
+
+        HarConfig har();
+
+        ChaosFaultConfig fault();
+
+        ChaosNetworkConfig network();
+
+        interface HarConfig {
+            /** Whether every request/response pair is appended to the HAR log. */
+            @WithDefault("false")
+            boolean enabled();
+
+            /** Where to write the HAR 1.2 log. Defaults to {@code ./floci-chaos.har} when unset. */
+            Optional<String> file();
+        }
+
+        interface ChaosFaultConfig {
+            /** Probability of the default injected fault, which is Throttling. */
+            @WithDefault("0.0")
+            double faultProbability();
+
+            @WithDefault("0.0")
+            double throttleProbability();
+
+            @WithDefault("0.0")
+            double accessDeniedProbability();
+        }
+
+        interface ChaosNetworkConfig {
+            @WithDefault("0.0")
+            double latencyProbability();
+
+            /** Delay applied when the latency roll fires, in milliseconds. */
+            @WithDefault("0")
+            long latencyMs();
+
+            @WithDefault("0.0")
+            double noResponseProbability();
+        }
     }
 
     interface DnsConfig {

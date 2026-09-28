@@ -349,6 +349,8 @@ class EventBridgeSchedulerIntegrationTest {
                     @Override public int awsHttpsPort() { return 443; }
                 };
             }
+            @Override
+            public ChaosConfig chaos() { return null; }
         };
     }
 }
