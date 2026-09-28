@@ -31,8 +31,8 @@ import java.util.UUID;
  * <p>One roll per condition, in this order:
  * <ul>
  *   <li>latency: sleeps {@code floci.chaos.network.latency-ms} and lets the request proceed</li>
- *   <li>no response: a bounded sleep standing in for a dropped connection (see
- *       {@link #simulateNoResponse})</li>
+ *   <li>no response: a bounded sleep standing in for a dropped connection, then a terminal
+ *       timeout error so the resource never runs (see {@link #simulateNoResponse})</li>
  *   <li>throttle: aborts with the protocol's throttling error</li>
  *   <li>access denied: aborts with the protocol's access-denied error</li>
  *   <li>generic fault: aborts with throttling, the default injected fault</li>
@@ -49,6 +49,7 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
 
     private static final String THROTTLE_MESSAGE = "Rate exceeded";
     private static final String ACCESS_DENIED_MESSAGE = "Access denied by Floci chaos injection";
+    private static final String NO_RESPONSE_MESSAGE = "Request timed out (Floci chaos no-response injection)";
 
     /**
      * How much longer than the configured latency a "no response" waits. The stand-in is a long
@@ -101,7 +102,7 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
                 injected, ctx.getMethod(), ctx.getUriInfo().getPath());
 
         switch (injected) {
-            case NO_RESPONSE -> simulateNoResponse(network.latencyMs());
+            case NO_RESPONSE -> ctx.abortWith(simulateNoResponse(network.latencyMs(), resolveShape(ctx)));
             case THROTTLE -> ctx.abortWith(throttlingResponse(resolveShape(ctx)));
             case ACCESS_DENIED -> ctx.abortWith(accessDeniedResponse(resolveShape(ctx)));
             case NONE -> {
@@ -139,12 +140,19 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
     }
 
     /**
-     * Stands in for a dropped connection by holding the request long past any client timeout and
-     * then letting it proceed normally. Bounded on purpose: see {@link #NO_RESPONSE_FACTOR}.
+     * Stands in for a dropped connection: holds the request long past any client timeout, then
+     * ABORTS it so the resource never runs. Aborting rather than proceeding is deliberate. If the
+     * request were allowed through after the sleep, a client that already timed out and retried a
+     * mutating request would have the delayed original also perform its mutation, causing
+     * duplicate effects. The bounded sleep still simulates the client-visible hang (a real
+     * never-returning filter would leak the serving thread; see {@link #NO_RESPONSE_FACTOR}), and
+     * the terminal error is shaped for the caller's protocol so an SDK that is still waiting can
+     * parse the timeout rather than choke on an unexpected body.
      */
-    private static void simulateNoResponse(long latencyMs) {
+    private static Response simulateNoResponse(long latencyMs, ErrorShape shape) {
         long requested = latencyMs > 0 ? latencyMs * NO_RESPONSE_FACTOR : NO_RESPONSE_DEFAULT_MS;
         sleep(Math.min(requested, NO_RESPONSE_MAX_MS));
+        return timeoutResponse(shape);
     }
 
     private static void sleep(long millis) {
@@ -160,12 +168,15 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
     }
 
     /**
-     * The error shape this request's caller can parse. Taken from the protocol claim when there is
-     * one, with S3 keyed off the credential scope as {@link IamEnforcementFilter} does, and
-     * falling back to the same form-encoded sniff when no claim was made.
+     * The error shape this request's caller can parse. S3 is detected first, keyed off the signing
+     * service in either the {@code Authorization} header or, for a presigned request, the
+     * {@code X-Amz-Credential} query parameter (which is where a presigned request carries its
+     * credential scope, absent from any header). Both the {@code s3} scope and the
+     * {@code s3express} scope map to S3 XML. Otherwise the shape comes from the protocol claim,
+     * falling back to the form-encoded sniff when no claim was made.
      */
-    private static ErrorShape resolveShape(ContainerRequestContext ctx) {
-        if ("s3".equals(SigV4CredentialScope.serviceName(ctx.getHeaderString("Authorization")).orElse(null))) {
+    static ErrorShape resolveShape(ContainerRequestContext ctx) {
+        if (isS3SigningScope(signingService(ctx))) {
             return ErrorShape.S3_XML;
         }
         if (ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY) instanceof ProtocolClaim claim
@@ -173,12 +184,25 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
             if (claim.protocol() == WireProtocol.AWS_QUERY) {
                 return ErrorShape.QUERY_XML;
             }
-            if (claim.service() != null && "s3".equals(claim.service().externalKey())) {
+            if (claim.service() != null && isS3SigningScope(claim.service().externalKey())) {
                 return ErrorShape.S3_XML;
             }
             return ErrorShape.JSON;
         }
         return isFormEncoded(ctx.getMediaType()) ? ErrorShape.QUERY_XML : ErrorShape.JSON;
+    }
+
+    /** The SigV4 signing service, from the Authorization header or a presigned X-Amz-Credential. */
+    private static String signingService(ContainerRequestContext ctx) {
+        return SigV4CredentialScope.serviceName(ctx.getHeaderString("Authorization"))
+                .or(() -> SigV4CredentialScope.serviceNameFromCredential(
+                        ctx.getUriInfo().getQueryParameters().getFirst("X-Amz-Credential")))
+                .orElse(null);
+    }
+
+    /** S3 and S3 Express both answer with S3 XML; both sign under an S3-family scope. */
+    private static boolean isS3SigningScope(String service) {
+        return "s3".equals(service) || "s3express".equals(service);
     }
 
     private static boolean isFormEncoded(MediaType mediaType) {
@@ -188,7 +212,7 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
     }
 
     /** S3 answers a throttle with {@code SlowDown} and 503, every other protocol with a 400. */
-    private static Response throttlingResponse(ErrorShape shape) {
+    static Response throttlingResponse(ErrorShape shape) {
         return switch (shape) {
             case QUERY_XML -> queryXmlError("Throttling", THROTTLE_MESSAGE, 400);
             case JSON -> jsonError("ThrottlingException", THROTTLE_MESSAGE, 400);
@@ -196,11 +220,24 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
         };
     }
 
-    private static Response accessDeniedResponse(ErrorShape shape) {
+    static Response accessDeniedResponse(ErrorShape shape) {
         return switch (shape) {
             case QUERY_XML -> queryXmlError("AccessDenied", ACCESS_DENIED_MESSAGE, 403);
             case JSON -> jsonError("AccessDeniedException", ACCESS_DENIED_MESSAGE, 403);
             case S3_XML -> s3XmlError("AccessDenied", ACCESS_DENIED_MESSAGE, 403);
+        };
+    }
+
+    /**
+     * The terminal error for a simulated no-response, once the bounded hang has elapsed. S3 uses
+     * its {@code RequestTimeout} (400); other protocols use a 504 gateway-timeout-style error, the
+     * closest retryable shape their SDKs recognise for "the request did not complete in time".
+     */
+    static Response timeoutResponse(ErrorShape shape) {
+        return switch (shape) {
+            case QUERY_XML -> queryXmlError("RequestTimeout", NO_RESPONSE_MESSAGE, 504);
+            case JSON -> jsonError("RequestTimeoutException", NO_RESPONSE_MESSAGE, 504);
+            case S3_XML -> s3XmlError("RequestTimeout", NO_RESPONSE_MESSAGE, 400);
         };
     }
 
@@ -247,7 +284,7 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
         ACCESS_DENIED
     }
 
-    private enum ErrorShape {
+    enum ErrorShape {
         QUERY_XML,
         JSON,
         S3_XML

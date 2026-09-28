@@ -288,8 +288,8 @@ floci:
   chaos:
     enabled: false                     # FLOCI_CHAOS_ENABLED — master switch for fault and network injection
     har:
-      enabled: false                   # FLOCI_CHAOS_HAR_ENABLED — log every request/response pair as HAR 1.2
-      # file: ./floci-chaos.har        # FLOCI_CHAOS_HAR_FILE — HAR log path (default: ./floci-chaos.har)
+      enabled: false                   # FLOCI_CHAOS_HAR_ENABLED — log every request/response pair as one JSON object per line (JSONL)
+      # file: ./floci-chaos.jsonl      # FLOCI_CHAOS_HAR_FILE — request/response log path (default: ./floci-chaos.jsonl)
     fault:
       fault-probability: 0.0           # FLOCI_CHAOS_FAULT_FAULT_PROBABILITY — generic injected fault, served as Throttling
       throttle-probability: 0.0        # FLOCI_CHAOS_FAULT_THROTTLE_PROBABILITY

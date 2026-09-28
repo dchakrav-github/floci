@@ -72,6 +72,13 @@ public class HarLoggingFilter implements ContainerRequestFilter, ContainerRespon
     /** Stands in for a body {@link HarRequestBodyFilter} declined to buffer because of its size. */
     static final String TRUNCATED = "<floci: body not captured, too large>";
 
+    /** Stands in for a body unreadable because the request was handled on the Vert.x IO thread. */
+    static final String NOT_BUFFERED_IO_THREAD =
+            "<floci: body not captured, request handled on the IO thread>";
+
+    /** Header/query values carrying replayable secrets are stored as this instead of the value. */
+    static final String REDACTED = "<floci: redacted>";
+
     /** Bodies larger than this are not buffered, so a multi-gigabyte upload is never mirrored. */
     static final int MAX_BODY_BYTES = 256 * 1024;
 
@@ -100,7 +107,7 @@ public class HarLoggingFilter implements ContainerRequestFilter, ContainerRespon
             return;
         }
         try {
-            String url = ctx.getUriInfo().getRequestUri().toString();
+            String url = redactUrl(ctx.getUriInfo().getRequestUri().toString());
             RequestCapture capture = new RequestCapture(
                     System.nanoTime(),
                     Instant.now(),
@@ -153,7 +160,7 @@ public class HarLoggingFilter implements ContainerRequestFilter, ContainerRespon
     private Map<String, Object> buildEntry(RequestCapture capture, String requestBody,
                                            ContainerResponseContext response) {
         long elapsedMs = Duration.ofNanos(System.nanoTime() - capture.startedNanos()).toMillis();
-        String responseBody = responseBody(response);
+        ResponseBody responseBody = responseBody(response);
 
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("method", capture.method());
@@ -173,9 +180,12 @@ public class HarLoggingFilter implements ContainerRequestFilter, ContainerRespon
         }
 
         Map<String, Object> content = new LinkedHashMap<>();
-        content.put("size", byteLength(responseBody));
+        content.put("size", responseBody.originalSize());
         content.put("mimeType", mimeType(response.getMediaType()));
-        content.put("text", responseBody == null ? "" : responseBody);
+        content.put("text", responseBody.text());
+        if (responseBody.encoding() != null) {
+            content.put("encoding", responseBody.encoding());
+        }
 
         Map<String, Object> responseNode = new LinkedHashMap<>();
         responseNode.put("status", response.getStatus());
@@ -186,7 +196,7 @@ public class HarLoggingFilter implements ContainerRequestFilter, ContainerRespon
         responseNode.put("content", content);
         responseNode.put("redirectURL", "");
         responseNode.put("headersSize", -1);
-        responseNode.put("bodySize", byteLength(responseBody));
+        responseNode.put("bodySize", responseBody.originalSize());
 
         Map<String, Object> timings = new LinkedHashMap<>();
         timings.put("send", 0);
@@ -240,16 +250,30 @@ public class HarLoggingFilter implements ContainerRequestFilter, ContainerRespon
         return Path.of(configured);
     }
 
-    private String responseBody(ContainerResponseContext response) {
+    private ResponseBody responseBody(ContainerResponseContext response) {
         Object entity = response.getEntity();
         return switch (entity) {
-            case null -> null;
-            case String text -> truncate(text);
-            case byte[] bytes -> new String(bytes, 0, Math.min(bytes.length, MAX_BODY_BYTES),
-                    StandardCharsets.UTF_8);
-            case CharSequence text -> truncate(text.toString());
-            default -> serialize(entity);
+            case null -> ResponseBody.EMPTY;
+            case String text -> ResponseBody.text(truncate(text));
+            case byte[] bytes -> encodeBytes(bytes);
+            case CharSequence text -> ResponseBody.text(truncate(text.toString()));
+            default -> ResponseBody.text(serialize(entity));
         };
+    }
+
+    /**
+     * A {@code byte[]} response (e.g. CBOR, or any binary content) is stored base64 with
+     * {@code encoding=base64} and its ORIGINAL byte count, rather than being decoded as UTF-8:
+     * decoding mangles non-text bytes and makes the logged size disagree with what the client
+     * received. Bytes that happen to be valid UTF-8 could be stored as text, but detecting that
+     * reliably is not worth the ambiguity, so all {@code byte[]} bodies are base64.
+     */
+    static ResponseBody encodeBytes(byte[] bytes) {
+        int originalSize = bytes.length;
+        byte[] capped = bytes.length <= MAX_BODY_BYTES
+                ? bytes : java.util.Arrays.copyOf(bytes, MAX_BODY_BYTES);
+        String base64 = java.util.Base64.getEncoder().encodeToString(capped);
+        return new ResponseBody(base64, "base64", originalSize);
     }
 
     private String serialize(Object entity) {
@@ -279,21 +303,66 @@ public class HarLoggingFilter implements ContainerRequestFilter, ContainerRespon
         return mediaType == null ? "" : mediaType.toString();
     }
 
+    /**
+     * Header names whose values are replayable secrets: the SigV4 signature and any session
+     * token. Redacted before anything is written, so a reader of the log cannot replay a
+     * still-valid signed request. Matched case-insensitively.
+     */
+    private static final java.util.Set<String> SECRET_HEADERS = java.util.Set.of(
+            "authorization", "x-amz-security-token", "x-amz-content-sha256");
+
+    /**
+     * Query parameter names carrying replayable secrets on a presigned URL. The credential's
+     * access-key id is captured separately as {@code callerAccessKeyId} (not a secret), but the
+     * signature, the security token and the full credential string are redacted here.
+     */
+    private static final java.util.Set<String> SECRET_QUERY_PARAMS = java.util.Set.of(
+            "X-Amz-Signature", "X-Amz-Security-Token", "X-Amz-Credential");
+
     private static List<Map<String, String>> headerList(MultivaluedMap<String, String> headers) {
         List<Map<String, String>> result = new ArrayList<>();
         if (headers == null) {
             return result;
         }
         for (Map.Entry<String, List<String>> header : headers.entrySet()) {
+            boolean secret = SECRET_HEADERS.contains(header.getKey().toLowerCase(java.util.Locale.ROOT));
             for (String value : header.getValue()) {
-                result.add(Map.of("name", header.getKey(), "value", value == null ? "" : value));
+                String stored = secret ? REDACTED : (value == null ? "" : value);
+                result.add(Map.of("name", header.getKey(), "value", stored));
             }
         }
         return result;
     }
 
     private static List<Map<String, String>> queryStringList(ContainerRequestContext ctx) {
-        return headerList(ctx.getUriInfo().getQueryParameters());
+        MultivaluedMap<String, String> params = ctx.getUriInfo().getQueryParameters();
+        List<Map<String, String>> result = new ArrayList<>();
+        if (params == null) {
+            return result;
+        }
+        for (Map.Entry<String, List<String>> param : params.entrySet()) {
+            boolean secret = SECRET_QUERY_PARAMS.contains(param.getKey());
+            for (String value : param.getValue()) {
+                String stored = secret ? REDACTED : (value == null ? "" : value);
+                result.add(Map.of("name", param.getKey(), "value", stored));
+            }
+        }
+        return result;
+    }
+
+    /**
+     * The request URL with any presigned-secret query parameters redacted, so the stored URL
+     * cannot be replayed as a still-valid signed request. Non-secret parameters are preserved.
+     */
+    static String redactUrl(String url) {
+        if (url == null) {
+            return null;
+        }
+        String redacted = url;
+        for (String param : SECRET_QUERY_PARAMS) {
+            redacted = redacted.replaceAll("([?&]" + Pattern.quote(param) + "=)[^&]*", "$1" + REDACTED);
+        }
+        return redacted;
     }
 
     /** Same resolution the health and info endpoints use, so the HAR creator matches them. */
@@ -324,6 +393,21 @@ public class HarLoggingFilter implements ContainerRequestFilter, ContainerRespon
             return presigned.split("/", 2)[0];
         }
         return null;
+    }
+
+    /**
+     * A captured response body. {@code text} is the stored representation (UTF-8 text, or base64
+     * for binary), {@code encoding} is {@code "base64"} for binary content and {@code null} for
+     * text, and {@code originalSize} is the true byte count of the body the client received,
+     * before any truncation to {@link #MAX_BODY_BYTES}.
+     */
+    record ResponseBody(String text, String encoding, int originalSize) {
+        static final ResponseBody EMPTY = new ResponseBody("", null, 0);
+
+        static ResponseBody text(String value) {
+            String stored = value == null ? "" : value;
+            return new ResponseBody(stored, null, stored.getBytes(StandardCharsets.UTF_8).length);
+        }
     }
 
     /**
