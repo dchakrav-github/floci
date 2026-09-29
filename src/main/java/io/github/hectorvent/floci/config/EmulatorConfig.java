@@ -175,7 +175,8 @@ public interface EmulatorConfig {
      * {@link HarConfig#enabled()} is.
      *
      * <p>Environment variables follow the usual mapping:
-     * {@code FLOCI_CHAOS_ENABLED}, {@code FLOCI_CHAOS_HAR_ENABLED}, {@code FLOCI_CHAOS_HAR_FILE},
+     * {@code FLOCI_CHAOS_ENABLED}, {@code FLOCI_CHAOS_SEED}, {@code FLOCI_CHAOS_HAR_ENABLED},
+     * {@code FLOCI_CHAOS_HAR_FILE},
      * {@code FLOCI_CHAOS_FAULT_FAULT_PROBABILITY},
      * {@code FLOCI_CHAOS_FAULT_THROTTLE_PROBABILITY},
      * {@code FLOCI_CHAOS_FAULT_ACCESS_DENIED_PROBABILITY},
@@ -188,6 +189,19 @@ public interface EmulatorConfig {
         /** Main switch for fault and network injection. HAR logging has its own switch. */
         @WithDefault("false")
         boolean enabled();
+
+        /**
+         * Optional seed for deterministic fault injection. When unset, fault and latency rolls are
+         * nondeterministic (a fresh random stream per process). When set, every roll is a pure
+         * function of the seed, a stable per-request key and the decision point, so a replay with
+         * the same seed and the same sequence of requests reproduces exactly the same faults,
+         * independent of thread interleaving. This is the deterministic-simulation (DST) mode:
+         * pick a seed, find a sequence that breaks the workload, then replay that seed to
+         * reproduce and debug it. The per-request key prefers the SDK's
+         * {@code amz-sdk-invocation-id} (constant across a call's retries) and falls back to the
+         * method, path and SigV4 signature.
+         */
+        Optional<Long> seed();
 
         HarConfig har();
 

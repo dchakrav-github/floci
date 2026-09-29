@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.core.common;
 
 import io.github.hectorvent.floci.core.common.ChaosInterceptorFilter.ErrorShape;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.MultivaluedHashMap;
@@ -14,6 +15,7 @@ import java.util.Set;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.not;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -200,6 +202,101 @@ class ChaosInterceptorFilterTest {
         return ChaosInterceptorFilter.isFlociInternalRoute(ctx.ctx());
     }
 
+    // ---- deterministic (seeded) rolls ----
+
+    @Test
+    void seededRollIsReproducibleForSameInputs() {
+        // DST property: the same seed, request key and decision point always yield the same draw,
+        // so a replay reproduces the same faults regardless of thread interleaving.
+        double first = ChaosInterceptorFilter.seededRoll(42L, "req-1", ChaosInterceptorFilter.RollPoint.THROTTLE);
+        double again = ChaosInterceptorFilter.seededRoll(42L, "req-1", ChaosInterceptorFilter.RollPoint.THROTTLE);
+        assertThat(again, equalTo(first));
+    }
+
+    @Test
+    void seededRollIsInRange() {
+        for (String key : new String[] {"a", "b", "c", "req-xyz"}) {
+            double roll = ChaosInterceptorFilter.seededRoll(7L, key, ChaosInterceptorFilter.RollPoint.FAULT);
+            assertThat("roll >= 0", roll >= 0.0, equalTo(true));
+            assertThat("roll < 1", roll < 1.0, equalTo(true));
+        }
+    }
+
+    @Test
+    void differentSeedsProduceDifferentDrawSequences() {
+        // Not every single point need differ, but across many keys the two seeds must diverge,
+        // otherwise the seed would not actually control the outcome.
+        int differences = 0;
+        for (int i = 0; i < 200; i++) {
+            String key = "req-" + i;
+            double a = ChaosInterceptorFilter.seededRoll(1L, key, ChaosInterceptorFilter.RollPoint.THROTTLE);
+            double b = ChaosInterceptorFilter.seededRoll(2L, key, ChaosInterceptorFilter.RollPoint.THROTTLE);
+            if (a != b) {
+                differences++;
+            }
+        }
+        assertThat("seeds diverge across keys", differences > 190, equalTo(true));
+    }
+
+    @Test
+    void differentDecisionPointsDoNotAliasUnderOneSeedAndKey() {
+        // The per-decision salt keeps a request's latency roll independent of its throttle roll,
+        // so one probability cannot silently drive another.
+        double latency = ChaosInterceptorFilter.seededRoll(99L, "req-1", ChaosInterceptorFilter.RollPoint.LATENCY);
+        double throttle = ChaosInterceptorFilter.seededRoll(99L, "req-1", ChaosInterceptorFilter.RollPoint.THROTTLE);
+        assertThat(latency, not(equalTo(throttle)));
+    }
+
+    @Test
+    void seededFaultSelectionIsStableAcrossRuns() {
+        // End to end through filter(): with a fixed seed and a 0.5 throttle probability, the set of
+        // request keys that get throttled must be identical on a second pass over the same keys.
+        java.util.List<String> throttledRunA = seededThrottleDecisions(2024L);
+        java.util.List<String> throttledRunB = seededThrottleDecisions(2024L);
+        assertThat(throttledRunB, equalTo(throttledRunA));
+        // And a different seed changes which requests are throttled (sanity: not all-or-nothing).
+        java.util.List<String> throttledOtherSeed = seededThrottleDecisions(777L);
+        assertThat(throttledOtherSeed, not(equalTo(throttledRunA)));
+    }
+
+    /** Runs filter() over 100 distinct signed requests and returns which ones were throttled. */
+    private static java.util.List<String> seededThrottleDecisions(long seed) {
+        ChaosInterceptorFilter filter = new ChaosInterceptorFilter(
+                () -> configWithSeed(seed, 0.5));
+        java.util.List<String> throttled = new java.util.ArrayList<>();
+        for (int i = 0; i < 100; i++) {
+            String invocationId = "invocation-" + i;
+            ContainerRequestContextStub ctx = new ContainerRequestContextStub();
+            ctx.path("/some/aws/path");
+            ctx.header("amz-sdk-invocation-id", invocationId);
+            filter.filter(ctx.ctx());
+            if (ctx.aborted()) {
+                throttled.add(invocationId);
+            }
+        }
+        return throttled;
+    }
+
+    /** A minimal EmulatorConfig whose chaos block is enabled, seeded, with a throttle probability. */
+    private static EmulatorConfig configWithSeed(long seed, double throttleProbability) {
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.ChaosConfig chaos = mock(EmulatorConfig.ChaosConfig.class);
+        EmulatorConfig.ChaosConfig.ChaosFaultConfig fault = mock(EmulatorConfig.ChaosConfig.ChaosFaultConfig.class);
+        EmulatorConfig.ChaosConfig.ChaosNetworkConfig network = mock(EmulatorConfig.ChaosConfig.ChaosNetworkConfig.class);
+        when(config.chaos()).thenReturn(chaos);
+        when(chaos.enabled()).thenReturn(true);
+        when(chaos.seed()).thenReturn(java.util.Optional.of(seed));
+        when(chaos.fault()).thenReturn(fault);
+        when(chaos.network()).thenReturn(network);
+        when(network.latencyProbability()).thenReturn(0.0);
+        when(network.noResponseProbability()).thenReturn(0.0);
+        when(network.latencyMs()).thenReturn(0L);
+        when(fault.throttleProbability()).thenReturn(throttleProbability);
+        when(fault.accessDeniedProbability()).thenReturn(0.0);
+        when(fault.faultProbability()).thenReturn(0.0);
+        return config;
+    }
+
     private static String entityString(Response response) {
         return String.valueOf(response.getEntity());
     }
@@ -214,10 +311,16 @@ class ChaosInterceptorFilterTest {
         private final ContainerRequestContext ctx = mock(ContainerRequestContext.class);
         private final UriInfo uriInfo = mock(UriInfo.class);
         private final MultivaluedMap<String, String> queryParams = new MultivaluedHashMap<>();
+        private boolean aborted;
 
         ContainerRequestContextStub() {
             when(ctx.getUriInfo()).thenReturn(uriInfo);
             when(uriInfo.getQueryParameters()).thenReturn(queryParams);
+            when(ctx.getMethod()).thenReturn("POST");
+            org.mockito.Mockito.doAnswer(invocation -> {
+                aborted = true;
+                return null;
+            }).when(ctx).abortWith(org.mockito.ArgumentMatchers.any());
         }
 
         void authorization(String value) {
@@ -234,6 +337,14 @@ class ChaosInterceptorFilterTest {
 
         void path(String path) {
             when(uriInfo.getPath()).thenReturn(path);
+        }
+
+        void header(String name, String value) {
+            when(ctx.getHeaderString(name)).thenReturn(value);
+        }
+
+        boolean aborted() {
+            return aborted;
         }
 
         void claim(ProtocolClaim claim) {

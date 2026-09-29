@@ -13,6 +13,9 @@ import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.ext.Provider;
 import org.jboss.logging.Logger;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Random;
 import java.util.UUID;
 
@@ -66,8 +69,23 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
     /**
      * An instance field, not a static one, so no {@code --initialize-at-run-time} entry is needed:
      * the provider is constructed at runtime, so its seed is never captured into the native image.
+     * Used only for the unseeded (nondeterministic) mode; the seeded mode derives its rolls from
+     * {@link #seededRoll} instead and never touches this stream.
      */
     private final Random random = new Random();
+
+    /**
+     * The decision points a roll is taken at. Each is a distinct salt so that, under a fixed seed,
+     * a request's latency roll cannot alias its throttle roll: the two draw from independent
+     * deterministic streams even though they share the same request key.
+     */
+    enum RollPoint {
+        LATENCY,
+        NO_RESPONSE,
+        THROTTLE,
+        ACCESS_DENIED,
+        FAULT
+    }
 
     // jakarta.inject.Provider qualified inline: this file imports jakarta.ws.rs.ext.Provider,
     // the JAX-RS annotation, and the two types collide. Resolved lazily for the same reason as
@@ -95,13 +113,20 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
         ChaosNetworkConfig network = chaos.network();
         ChaosFaultConfig fault = chaos.fault();
 
-        if (rolls(network.latencyProbability())) {
+        // In seeded mode the outcome is a pure function of (seed, request key, decision), so a
+        // replay with the same seed and the same request sequence reproduces the same faults
+        // regardless of how the requests interleave across threads. Unseeded mode keeps the
+        // original behaviour: draws from a shared Random, nondeterministic under concurrency.
+        Long seed = chaos.seed().orElse(null);
+        String requestKey = seed == null ? null : requestKey(ctx);
+
+        if (rolls(seed, requestKey, RollPoint.LATENCY, network.latencyProbability())) {
             LOG.debugv("Chaos: injecting {0}ms latency into {1} {2}",
                     network.latencyMs(), ctx.getMethod(), ctx.getUriInfo().getPath());
             sleep(network.latencyMs());
         }
 
-        InjectedFault injected = selectFault(network, fault);
+        InjectedFault injected = selectFault(network, fault, seed, requestKey);
         if (injected == InjectedFault.NONE) {
             return;
         }
@@ -123,27 +148,98 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
      * {@code fault-probability} maps to {@link InjectedFault#THROTTLE}, the default injected
      * fault, so a caller who only wants "something goes wrong sometimes" gets a retryable error.
      */
-    private InjectedFault selectFault(ChaosNetworkConfig network, ChaosFaultConfig fault) {
-        if (rolls(network.noResponseProbability())) {
+    private InjectedFault selectFault(ChaosNetworkConfig network, ChaosFaultConfig fault,
+                                      Long seed, String requestKey) {
+        if (rolls(seed, requestKey, RollPoint.NO_RESPONSE, network.noResponseProbability())) {
             return InjectedFault.NO_RESPONSE;
         }
-        if (rolls(fault.throttleProbability())) {
+        if (rolls(seed, requestKey, RollPoint.THROTTLE, fault.throttleProbability())) {
             return InjectedFault.THROTTLE;
         }
-        if (rolls(fault.accessDeniedProbability())) {
+        if (rolls(seed, requestKey, RollPoint.ACCESS_DENIED, fault.accessDeniedProbability())) {
             return InjectedFault.ACCESS_DENIED;
         }
-        if (rolls(fault.faultProbability())) {
+        if (rolls(seed, requestKey, RollPoint.FAULT, fault.faultProbability())) {
             return InjectedFault.THROTTLE;
         }
         return InjectedFault.NONE;
     }
 
-    private boolean rolls(double probability) {
+    /**
+     * Whether a roll at {@code probability} fires. When {@code seed} is {@code null} the draw is
+     * nondeterministic (a shared {@link Random}); when it is set the draw is a pure function of
+     * the seed, the request key and the decision point, so it reproduces on replay.
+     */
+    private boolean rolls(Long seed, String requestKey, RollPoint point, double probability) {
         if (probability <= 0.0) {
             return false;
         }
-        return probability >= 1.0 || random.nextDouble() < probability;
+        if (probability >= 1.0) {
+            return true;
+        }
+        double draw = seed == null ? random.nextDouble() : seededRoll(seed, requestKey, point);
+        return draw < probability;
+    }
+
+    /**
+     * A deterministic draw in {@code [0, 1)} for one decision point of one request under a seed.
+     * SHA-256 over {@code seed | request key | decision} gives a value that depends on all three
+     * and nothing else, so concurrent requests never contend for a shared stream and a replay with
+     * the same inputs yields the same draw. The top 53 bits of the digest are scaled to a double,
+     * matching {@link Random#nextDouble}'s resolution.
+     */
+    static double seededRoll(long seed, String requestKey, RollPoint point) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            digest.update(Long.toString(seed).getBytes(StandardCharsets.UTF_8));
+            digest.update((byte) 0);
+            digest.update(requestKey.getBytes(StandardCharsets.UTF_8));
+            digest.update((byte) 0);
+            digest.update(point.name().getBytes(StandardCharsets.UTF_8));
+            byte[] hash = digest.digest();
+            long bits = 0L;
+            for (int i = 0; i < 8; i++) {
+                bits = (bits << 8) | (hash[i] & 0xFFL);
+            }
+            // Top 53 bits to a double in [0, 1), the same construction as Random#nextDouble.
+            return (bits >>> 11) * 0x1.0p-53;
+        } catch (NoSuchAlgorithmException e) {
+            // SHA-256 is required of every JVM, so this is unreachable in practice.
+            throw new IllegalStateException("SHA-256 unavailable for seeded chaos", e);
+        }
+    }
+
+    /**
+     * A stable identity for the request, used only in seeded mode so replays line up. Preference
+     * order: the SDK's {@code amz-sdk-invocation-id} (a UUID the SDK keeps constant across retries
+     * of the same logical call, so a retried request re-rolls identically), then a composite of
+     * method, path, caller access key and SigV4 signature. The signature ties the key to the exact
+     * signed request without being a secret we log. Never null in seeded mode.
+     */
+    private static String requestKey(ContainerRequestContext ctx) {
+        String invocationId = ctx.getHeaderString("amz-sdk-invocation-id");
+        if (invocationId != null && !invocationId.isEmpty()) {
+            return invocationId;
+        }
+        String signature = sigV4Signature(ctx);
+        return ctx.getMethod()
+                + ' ' + ctx.getUriInfo().getPath()
+                + '|' + (signature != null ? signature : "");
+    }
+
+    /** The {@code Signature=} value from the SigV4 Authorization header, or null when unsigned. */
+    private static String sigV4Signature(ContainerRequestContext ctx) {
+        String auth = ctx.getHeaderString("Authorization");
+        if (auth == null) {
+            return null;
+        }
+        int idx = auth.indexOf("Signature=");
+        if (idx < 0) {
+            return null;
+        }
+        String tail = auth.substring(idx + "Signature=".length());
+        int comma = tail.indexOf(',');
+        return comma < 0 ? tail : tail.substring(0, comma);
     }
 
     /**

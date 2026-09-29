@@ -287,6 +287,7 @@ floci:
 
   chaos:
     enabled: false                     # FLOCI_CHAOS_ENABLED: main switch for fault and network injection
+    # seed:                            # FLOCI_CHAOS_SEED: fix the seed for deterministic (DST-style) fault injection; unset = nondeterministic. Same seed + same request sequence reproduces the same faults.
     har:
       # WARNING: the request/response log can contain plaintext secrets (STS/IAM secret access
       # keys, and credentials or tokens embedded in bodies or presigned URLs). Known secret
