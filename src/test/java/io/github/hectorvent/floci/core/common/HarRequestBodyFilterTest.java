@@ -5,6 +5,8 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.MockedStatic;
 
+import io.quarkus.runtime.BlockingOperationControl;
+
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -16,8 +18,6 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
-
-import io.quarkus.runtime.BlockingOperationControl;
 
 /**
  * Unit test for {@link HarRequestBodyFilter}'s bounded body read (finding #1): an

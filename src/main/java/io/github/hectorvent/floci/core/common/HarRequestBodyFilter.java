@@ -61,18 +61,26 @@ public class HarRequestBodyFilter implements ContainerRequestFilter {
     /**
      * Buffers up to {@link HarLoggingFilter#MAX_BODY_BYTES} of the request body for logging and
      * puts an equivalent stream back so the resource method still reads the whole body. Returns
-     * {@code null} when there is no body, and a marker when the read would block on the IO thread.
+     * {@code null} when there is no body, and a marker when the read would block on the IO thread
+     * or when the body is skipped for its size.
      *
-     * <p>The read is bounded by bytes, not by the declared {@code Content-Length}: a chunked or
-     * otherwise undeclared-length request reports {@code getLength() == -1}, so a length check
-     * alone would let {@code readAllBytes()} buffer the entire body (up to the server's much
-     * larger body limit) before truncation. Only the first {@code MAX_BODY_BYTES} are held; the
-     * rest of the original stream is chained back untouched via {@link SequenceInputStream}, so
-     * the resource still receives the full body while the log never holds more than the cap.
+     * <p>A body whose declared {@code Content-Length} already exceeds the cap is skipped without
+     * reading anything (the fast path): reading up to the cap of a large declared body would make
+     * the filter wait on a slow client and hold a worker thread before the resource runs, and on a
+     * blocking route (for example Bedrock {@code InvokeModel}) enough concurrent large requests
+     * could exhaust the worker pool. Only a body of unknown length (chunked, {@code getLength() ==
+     * -1}) is read, and then only bounded: {@code readNBytes} stops at the cap and the untouched
+     * remainder is chained back via {@link SequenceInputStream}, so the resource still receives the
+     * full body while the log never holds more than the cap.
      */
     static String captureRequestBody(ContainerRequestContext ctx) throws IOException {
         if (!ctx.hasEntity()) {
             return null;
+        }
+        // Fast path: a declared length over the cap is never read, so a large declared body cannot
+        // make this filter wait on the client and occupy a worker thread.
+        if (ctx.getLength() > HarLoggingFilter.MAX_BODY_BYTES) {
+            return HarLoggingFilter.TRUNCATED;
         }
         if (!BlockingOperationControl.isBlockingAllowed()) {
             return HarLoggingFilter.NOT_BUFFERED_IO_THREAD;
@@ -81,9 +89,9 @@ public class HarRequestBodyFilter implements ContainerRequestFilter {
         if (entityStream == null) {
             return null;
         }
-        // Read at most the cap; readNBytes stops there regardless of the declared length.
+        // Bounded read for an unknown or within-cap length; readNBytes stops at the cap.
         byte[] prefix = entityStream.readNBytes(HarLoggingFilter.MAX_BODY_BYTES);
-        // Peek one more byte to learn whether the body exceeded the cap without buffering it.
+        // Peek one more byte to learn whether an unknown-length body exceeded the cap.
         int overflow = entityStream.read();
         boolean truncated = overflow != -1;
         if (truncated) {

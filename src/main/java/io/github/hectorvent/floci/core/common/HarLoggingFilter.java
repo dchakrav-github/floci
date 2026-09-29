@@ -26,9 +26,13 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -271,8 +275,8 @@ public class HarLoggingFilter implements ContainerRequestFilter, ContainerRespon
     static ResponseBody encodeBytes(byte[] bytes) {
         int originalSize = bytes.length;
         byte[] capped = bytes.length <= MAX_BODY_BYTES
-                ? bytes : java.util.Arrays.copyOf(bytes, MAX_BODY_BYTES);
-        String base64 = java.util.Base64.getEncoder().encodeToString(capped);
+                ? bytes : Arrays.copyOf(bytes, MAX_BODY_BYTES);
+        String base64 = Base64.getEncoder().encodeToString(capped);
         return new ResponseBody(base64, "base64", originalSize);
     }
 
@@ -308,7 +312,7 @@ public class HarLoggingFilter implements ContainerRequestFilter, ContainerRespon
      * token. Redacted before anything is written, so a reader of the log cannot replay a
      * still-valid signed request. Matched case-insensitively.
      */
-    private static final java.util.Set<String> SECRET_HEADERS = java.util.Set.of(
+    private static final Set<String> SECRET_HEADERS = Set.of(
             "authorization", "x-amz-security-token", "x-amz-content-sha256");
 
     /**
@@ -316,7 +320,7 @@ public class HarLoggingFilter implements ContainerRequestFilter, ContainerRespon
      * access-key id is captured separately as {@code callerAccessKeyId} (not a secret), but the
      * signature, the security token and the full credential string are redacted here.
      */
-    private static final java.util.Set<String> SECRET_QUERY_PARAMS = java.util.Set.of(
+    private static final Set<String> SECRET_QUERY_PARAMS = Set.of(
             "X-Amz-Signature", "X-Amz-Security-Token", "X-Amz-Credential");
 
     private static List<Map<String, String>> headerList(MultivaluedMap<String, String> headers) {
@@ -325,7 +329,7 @@ public class HarLoggingFilter implements ContainerRequestFilter, ContainerRespon
             return result;
         }
         for (Map.Entry<String, List<String>> header : headers.entrySet()) {
-            boolean secret = SECRET_HEADERS.contains(header.getKey().toLowerCase(java.util.Locale.ROOT));
+            boolean secret = SECRET_HEADERS.contains(header.getKey().toLowerCase(Locale.ROOT));
             for (String value : header.getValue()) {
                 String stored = secret ? REDACTED : (value == null ? "" : value);
                 result.add(Map.of("name", header.getKey(), "value", stored));

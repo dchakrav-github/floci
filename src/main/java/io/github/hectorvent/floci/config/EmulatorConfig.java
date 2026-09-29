@@ -185,7 +185,7 @@ public interface EmulatorConfig {
      */
     interface ChaosConfig {
 
-        /** Master switch for fault and network injection. HAR logging has its own switch. */
+        /** Main switch for fault and network injection. HAR logging has its own switch. */
         @WithDefault("false")
         boolean enabled();
 
@@ -196,11 +196,20 @@ public interface EmulatorConfig {
         ChaosNetworkConfig network();
 
         interface HarConfig {
-            /** Whether every request/response pair is appended to the HAR log. */
+            /** Whether every request/response pair is appended to the request/response log. */
             @WithDefault("false")
             boolean enabled();
 
-            /** Where to write the HAR 1.2 log. Defaults to {@code ./floci-chaos.har} when unset. */
+            /**
+             * Where to write the request/response log, one JSON object per line (JSONL).
+             * Defaults to {@code ./floci-chaos.jsonl} when unset.
+             *
+             * <p>Logged bodies and URLs can contain plaintext secrets: STS and IAM responses
+             * carry secret access keys, and request/response bodies or presigned URLs can carry
+             * credentials and tokens. The filter redacts known secret headers and query
+             * parameters, but a service body that embeds a secret is logged as-is. Treat this log
+             * as sensitive: keep it off in shared environments and do not commit or share it.
+             */
             Optional<String> file();
         }
 

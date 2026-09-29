@@ -50,6 +50,7 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
     private static final String THROTTLE_MESSAGE = "Rate exceeded";
     private static final String ACCESS_DENIED_MESSAGE = "Access denied by Floci chaos injection";
     private static final String NO_RESPONSE_MESSAGE = "Request timed out (Floci chaos no-response injection)";
+    private static final String ROUTE53_XML_NAMESPACE = AwsNamespaces.ROUTE53;
 
     /**
      * How much longer than the configured latency a "no response" waits. The stand-in is a long
@@ -83,6 +84,12 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
     public void filter(ContainerRequestContext ctx) {
         ChaosConfig chaos = configProvider.get().chaos();
         if (!chaos.enabled()) {
+            return;
+        }
+        if (isFlociInternalRoute(ctx)) {
+            // Never fault Floci's own endpoints: the internal webhooks, the AWS helper routes and
+            // the health check are not the emulated AWS surface the caller is testing, and a chaos
+            // fault on them breaks the emulator itself rather than the workload under test.
             return;
         }
         ChaosNetworkConfig network = chaos.network();
@@ -168,11 +175,31 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
     }
 
     /**
+     * Floci's own endpoints, which chaos must never fault because they are the emulator's control
+     * surface, not the emulated AWS surface under test: the {@code /_floci/*} internal webhooks and
+     * assets, the {@code /_aws/*} helper routes (execute-api, SNS/SQS/SES/Kinesis callbacks) and the
+     * exact {@code /health} check. The match on {@code /health} is exact so it does not also catch
+     * Route 53's {@code /healthcheck} data-plane resource, which is a real emulated AWS surface.
+     */
+    static boolean isFlociInternalRoute(ContainerRequestContext ctx) {
+        String path = ctx.getUriInfo().getPath();
+        if (path == null) {
+            return false;
+        }
+        String normalized = path.startsWith("/") ? path : "/" + path;
+        return normalized.startsWith("/_floci/")
+                || normalized.startsWith("/_aws/")
+                || normalized.equals("/health");
+    }
+
+    /**
      * The error shape this request's caller can parse. S3 is detected first, keyed off the signing
      * service in either the {@code Authorization} header or, for a presigned request, the
      * {@code X-Amz-Credential} query parameter (which is where a presigned request carries its
      * credential scope, absent from any header). Both the {@code s3} scope and the
-     * {@code s3express} scope map to S3 XML. Otherwise the shape comes from the protocol claim,
+     * {@code s3express} scope map to S3 XML. CBOR services (CloudWatch defaults to
+     * smithy-rpc-v2-cbor) and rest-xml services (Route 53) get their own shapes, because a JSON
+     * body is unparseable by those SDKs. Otherwise the shape comes from the protocol claim,
      * falling back to the form-encoded sniff when no claim was made.
      */
     static ErrorShape resolveShape(ContainerRequestContext ctx) {
@@ -184,8 +211,15 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
             if (claim.protocol() == WireProtocol.AWS_QUERY) {
                 return ErrorShape.QUERY_XML;
             }
+            if (claim.protocol() == WireProtocol.RPCV2_CBOR
+                    || claim.protocol() == WireProtocol.AWS_CBOR_TARGET) {
+                return ErrorShape.CBOR;
+            }
             if (claim.service() != null && isS3SigningScope(claim.service().externalKey())) {
                 return ErrorShape.S3_XML;
+            }
+            if (claim.service() != null && isRestXmlService(claim.service().externalKey())) {
+                return ErrorShape.REST_XML;
             }
             return ErrorShape.JSON;
         }
@@ -205,6 +239,11 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
         return "s3".equals(service) || "s3express".equals(service);
     }
 
+    /** Route 53 speaks rest-xml, so its errors are namespaced XML rather than JSON. */
+    private static boolean isRestXmlService(String service) {
+        return "route53".equals(service);
+    }
+
     private static boolean isFormEncoded(MediaType mediaType) {
         return mediaType != null
                 && "application".equalsIgnoreCase(mediaType.getType())
@@ -213,19 +252,16 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
 
     /** S3 answers a throttle with {@code SlowDown} and 503, every other protocol with a 400. */
     static Response throttlingResponse(ErrorShape shape) {
-        return switch (shape) {
-            case QUERY_XML -> queryXmlError("Throttling", THROTTLE_MESSAGE, 400);
-            case JSON -> jsonError("ThrottlingException", THROTTLE_MESSAGE, 400);
-            case S3_XML -> s3XmlError("SlowDown", THROTTLE_MESSAGE, 503);
-        };
+        if (shape == ErrorShape.S3_XML) {
+            return errorFor(shape, "SlowDown", THROTTLE_MESSAGE, 503);
+        }
+        String code = shape == ErrorShape.JSON ? "ThrottlingException" : "Throttling";
+        return errorFor(shape, code, THROTTLE_MESSAGE, 400);
     }
 
     static Response accessDeniedResponse(ErrorShape shape) {
-        return switch (shape) {
-            case QUERY_XML -> queryXmlError("AccessDenied", ACCESS_DENIED_MESSAGE, 403);
-            case JSON -> jsonError("AccessDeniedException", ACCESS_DENIED_MESSAGE, 403);
-            case S3_XML -> s3XmlError("AccessDenied", ACCESS_DENIED_MESSAGE, 403);
-        };
+        String code = shape == ErrorShape.JSON ? "AccessDeniedException" : "AccessDenied";
+        return errorFor(shape, code, ACCESS_DENIED_MESSAGE, 403);
     }
 
     /**
@@ -234,10 +270,20 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
      * closest retryable shape their SDKs recognise for "the request did not complete in time".
      */
     static Response timeoutResponse(ErrorShape shape) {
+        int status = shape == ErrorShape.S3_XML ? 400 : 504;
+        String code = shape == ErrorShape.JSON ? "RequestTimeoutException" : "RequestTimeout";
+        return errorFor(shape, code, NO_RESPONSE_MESSAGE, status);
+    }
+
+    /** Builds the injected error in the wire shape the caller's SDK can parse. */
+    private static Response errorFor(ErrorShape shape, String code, String message, int status) {
         return switch (shape) {
-            case QUERY_XML -> queryXmlError("RequestTimeout", NO_RESPONSE_MESSAGE, 504);
-            case JSON -> jsonError("RequestTimeoutException", NO_RESPONSE_MESSAGE, 504);
-            case S3_XML -> s3XmlError("RequestTimeout", NO_RESPONSE_MESSAGE, 400);
+            case QUERY_XML -> queryXmlError(code, message, status);
+            case JSON -> jsonError(code, message, status);
+            case S3_XML -> s3XmlError(code, message, status);
+            case REST_XML -> restXmlError(code, message, status);
+            case CBOR -> CborErrorResponses.of(new AwsException(code, message, status),
+                    CborErrorResponses.GENERIC_CBOR_MEDIA_TYPE);
         };
     }
 
@@ -267,6 +313,24 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
         return Response.status(status).type(MediaType.APPLICATION_XML).entity(xml).build();
     }
 
+    /**
+     * The rest-xml error shape (Route 53), a namespaced {@code ErrorResponse} mirroring
+     * {@code Route53Controller}'s own error, so a rest-xml SDK parses the injected fault.
+     */
+    private static Response restXmlError(String code, String message, int status) {
+        String xml = new XmlBuilder()
+                .start("ErrorResponse", ROUTE53_XML_NAMESPACE)
+                  .start("Error")
+                    .elem("Type", "Sender")
+                    .elem("Code", code)
+                    .elem("Message", message)
+                  .end("Error")
+                  .elem("RequestId", UUID.randomUUID().toString())
+                .end("ErrorResponse")
+                .build();
+        return Response.status(status).type(MediaType.APPLICATION_XML).entity(xml).build();
+    }
+
     private static Response jsonError(String code, String message, int status) {
         return Response.status(status)
                 .type(MediaType.APPLICATION_JSON)
@@ -287,6 +351,8 @@ public class ChaosInterceptorFilter implements ContainerRequestFilter {
     enum ErrorShape {
         QUERY_XML,
         JSON,
-        S3_XML
+        S3_XML,
+        REST_XML,
+        CBOR
     }
 }

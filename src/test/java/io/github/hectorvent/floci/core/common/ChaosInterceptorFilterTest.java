@@ -43,6 +43,27 @@ class ChaosInterceptorFilterTest {
     }
 
     @Test
+    void cborClaimResolvesToCbor() {
+        // Maintainer #2: CloudWatch (and other smithy-rpc-v2-cbor services) cannot parse a JSON
+        // fault body, so a CBOR-protocol claim must resolve to the CBOR shape.
+        ContainerRequestContextStub rpcv2 = new ContainerRequestContextStub();
+        rpcv2.claim(new ProtocolClaim(WireProtocol.RPCV2_CBOR, descriptor("cloudwatch"), "PutMetricData", null));
+        assertThat(ChaosInterceptorFilter.resolveShape(rpcv2.ctx()), equalTo(ErrorShape.CBOR));
+
+        ContainerRequestContextStub target = new ContainerRequestContextStub();
+        target.claim(new ProtocolClaim(WireProtocol.AWS_CBOR_TARGET, descriptor("cloudwatch"), "PutMetricData", null));
+        assertThat(ChaosInterceptorFilter.resolveShape(target.ctx()), equalTo(ErrorShape.CBOR));
+    }
+
+    @Test
+    void route53ClaimResolvesToRestXml() {
+        // Maintainer #2: Route 53 speaks rest-xml; a JSON fault body is unparseable by its SDK.
+        ContainerRequestContextStub ctx = new ContainerRequestContextStub();
+        ctx.claim(new ProtocolClaim(WireProtocol.AWS_JSON_1_1, descriptor("route53"), "ListHostedZones", null));
+        assertThat(ChaosInterceptorFilter.resolveShape(ctx.ctx()), equalTo(ErrorShape.REST_XML));
+    }
+
+    @Test
     void s3AuthorizationHeaderResolvesToS3Xml() {
         ContainerRequestContextStub ctx = new ContainerRequestContextStub();
         ctx.authorization("AWS4-HMAC-SHA256 Credential=AKID/20260928/us-east-1/s3/aws4_request, "
@@ -121,6 +142,64 @@ class ChaosInterceptorFilterTest {
         assertThat(entityString(s3), containsString("RequestTimeout"));
     }
 
+    @Test
+    void restXmlFaultIsNamespacedErrorResponse() {
+        // Maintainer #2: a Route 53 fault must be a rest-xml ErrorResponse its SDK can parse,
+        // carrying the Route 53 document namespace and the error code.
+        Response throttle = ChaosInterceptorFilter.throttlingResponse(ErrorShape.REST_XML);
+        assertThat(throttle.getStatus(), equalTo(400));
+        assertThat(throttle.getMediaType().toString(), containsString("xml"));
+        String body = entityString(throttle);
+        assertThat(body, containsString("<ErrorResponse"));
+        assertThat(body, containsString("route53.amazonaws.com/doc/2013-04-01"));
+        assertThat(body, containsString("Throttling"));
+
+        Response denied = ChaosInterceptorFilter.accessDeniedResponse(ErrorShape.REST_XML);
+        assertThat(denied.getStatus(), equalTo(403));
+        assertThat(entityString(denied), containsString("AccessDenied"));
+    }
+
+    @Test
+    void cborFaultCarriesCborMediaTypeAndProtocolHeader() {
+        // Maintainer #2: a CloudWatch (rpc-v2-cbor) fault must be a CBOR response, not JSON, so the
+        // SDK can deserialise it. CborErrorResponses stamps the rpc-v2-cbor smithy-protocol header.
+        Response throttle = ChaosInterceptorFilter.throttlingResponse(ErrorShape.CBOR);
+        assertThat(throttle.getStatus(), equalTo(400));
+        assertThat(throttle.getMediaType().toString(), containsString("cbor"));
+        assertThat(throttle.getHeaderString("smithy-protocol"), containsString("rpc-v2-cbor"));
+
+        assertThat(ChaosInterceptorFilter.accessDeniedResponse(ErrorShape.CBOR).getStatus(), equalTo(403));
+        assertThat(ChaosInterceptorFilter.timeoutResponse(ErrorShape.CBOR).getStatus(), equalTo(504));
+    }
+
+    // ---- internal-route exclusion (maintainer #2) ----
+
+    @Test
+    void flociInternalRoutesAreExcludedFromChaos() {
+        // Maintainer #2: Floci's own control-plane and health routes must never receive injected
+        // faults, or chaos would break the emulator's own management surface.
+        assertThat(isInternal("/_floci/state"), equalTo(true));
+        assertThat(isInternal("_floci/state"), equalTo(true));
+        assertThat(isInternal("/_aws/lambda/invoke"), equalTo(true));
+        assertThat(isInternal("/health"), equalTo(true));
+    }
+
+    @Test
+    void awsDataPlaneRoutesAreNotExcluded() {
+        // The exclusion must be tight: real AWS routes, including Route 53's /healthcheck and
+        // data-plane paths, must still be eligible for chaos. Only exact /health is internal.
+        assertThat(isInternal("/healthcheck"), equalTo(false));
+        assertThat(isInternal("/2013-04-01/hostedzone"), equalTo(false));
+        assertThat(isInternal("/mybucket/mykey"), equalTo(false));
+        assertThat(isInternal("/"), equalTo(false));
+    }
+
+    private static boolean isInternal(String path) {
+        ContainerRequestContextStub ctx = new ContainerRequestContextStub();
+        ctx.path(path);
+        return ChaosInterceptorFilter.isFlociInternalRoute(ctx.ctx());
+    }
+
     private static String entityString(Response response) {
         return String.valueOf(response.getEntity());
     }
@@ -151,6 +230,10 @@ class ChaosInterceptorFilterTest {
 
         void mediaType(MediaType mediaType) {
             when(ctx.getMediaType()).thenReturn(mediaType);
+        }
+
+        void path(String path) {
+            when(uriInfo.getPath()).thenReturn(path);
         }
 
         void claim(ProtocolClaim claim) {

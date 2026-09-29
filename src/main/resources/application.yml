@@ -286,18 +286,22 @@ floci:
     reject-unknown-service-scope: true # FLOCI_PROTOCOLS_REJECT_UNKNOWN_SERVICE_SCOPE — reject REST requests signed for a service Floci does not implement
 
   chaos:
-    enabled: false                     # FLOCI_CHAOS_ENABLED — master switch for fault and network injection
+    enabled: false                     # FLOCI_CHAOS_ENABLED: main switch for fault and network injection
     har:
-      enabled: false                   # FLOCI_CHAOS_HAR_ENABLED — log every request/response pair as one JSON object per line (JSONL)
-      # file: ./floci-chaos.jsonl      # FLOCI_CHAOS_HAR_FILE — request/response log path (default: ./floci-chaos.jsonl)
+      # WARNING: the request/response log can contain plaintext secrets (STS/IAM secret access
+      # keys, and credentials or tokens embedded in bodies or presigned URLs). Known secret
+      # headers and query params are redacted, but secrets inside a service body are logged as-is.
+      # Keep this off in shared environments; treat the log file as sensitive.
+      enabled: false                   # FLOCI_CHAOS_HAR_ENABLED: log every request/response pair as one JSON object per line (JSONL)
+      # file: ./floci-chaos.jsonl      # FLOCI_CHAOS_HAR_FILE: request/response log path (default: ./floci-chaos.jsonl)
     fault:
-      fault-probability: 0.0           # FLOCI_CHAOS_FAULT_FAULT_PROBABILITY — generic injected fault, served as Throttling
+      fault-probability: 0.0           # FLOCI_CHAOS_FAULT_FAULT_PROBABILITY: generic injected fault, served as Throttling
       throttle-probability: 0.0        # FLOCI_CHAOS_FAULT_THROTTLE_PROBABILITY
       access-denied-probability: 0.0   # FLOCI_CHAOS_FAULT_ACCESS_DENIED_PROBABILITY
     network:
       latency-probability: 0.0         # FLOCI_CHAOS_NETWORK_LATENCY_PROBABILITY
-      latency-ms: 0                    # FLOCI_CHAOS_NETWORK_LATENCY_MS — delay applied when the latency roll fires
-      no-response-probability: 0.0     # FLOCI_CHAOS_NETWORK_NO_RESPONSE_PROBABILITY — simulated dropped connection
+      latency-ms: 0                    # FLOCI_CHAOS_NETWORK_LATENCY_MS: delay applied when the latency roll fires
+      no-response-probability: 0.0     # FLOCI_CHAOS_NETWORK_NO_RESPONSE_PROBABILITY: simulated dropped connection
 
   docker:
     log-max-size: "10m"
